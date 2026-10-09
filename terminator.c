@@ -214,15 +214,7 @@ int main(void)
         return 1;
     }
 
-    // Temporary test: run a real Bash command
-if (!text_buffer_append(&buffer, "user@terminator> pwd\n") ||
-    !run_command_capture(&buffer, "pwd"))
-{
-    fprintf(stderr, "Could not capture command output\n");
-    free(buffer.data);
-    XCloseDisplay(display);
-    return 1;
-}
+
 
     // Current command being typed
     char input[256] = "";
@@ -398,7 +390,7 @@ if (!text_buffer_append(&buffer, "user@terminator> pwd\n") ||
         running = 0;
     }
 
-    else if (key == XK_Return || key == XK_KP_Enter)
+   else if (key == XK_Return || key == XK_KP_Enter)
 {
     char submitted_line[sizeof(input) + 32];
 
@@ -413,8 +405,17 @@ if (!text_buffer_append(&buffer, "user@terminator> pwd\n") ||
         (size_t)written < sizeof(submitted_line) &&
         text_buffer_append(&buffer, submitted_line))
     {
+        // Execute the submitted command if it isn't empty
+        if (input_length > 0)
+        {
+            (void)run_command_capture(&buffer, input);
+        }
+
+        // Clear the command input
         input_length = 0;
         input[0] = '\0';
+
+        // Request a redraw
         changed = 1;
     }
 }
