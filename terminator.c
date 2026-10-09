@@ -1,10 +1,14 @@
-
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 typedef struct
 {
@@ -70,6 +74,124 @@ static int text_buffer_append(TextBuffer *buffer, const char *text)
     return 1;
 }
 
+// Execute one Bash command and capture its output into the buffer
+static int run_command_capture(TextBuffer *buffer, const char *command)
+{
+    int output_pipe[2];
+
+    // Create a pipe for the command's output
+    if (pipe(output_pipe) == -1)
+    {
+        perror("pipe");
+        return 0;
+    }
+
+    // Create a child process
+    pid_t child = fork();
+
+    if (child == -1)
+    {
+        perror("fork");
+        close(output_pipe[0]);
+        close(output_pipe[1]);
+        return 0;
+    }
+
+    if (child == 0)
+    {
+        // Child: close the unused read end
+        close(output_pipe[0]);
+
+        // Prevent the command from reading input from the console
+        int null_input = open("/dev/null", O_RDONLY);
+
+        if (null_input != -1)
+        {
+            dup2(null_input, STDIN_FILENO);
+            close(null_input);
+        }
+
+        // Redirect both stdout and stderr into the pipe
+        if (dup2(output_pipe[1], STDOUT_FILENO) == -1 ||
+            dup2(output_pipe[1], STDERR_FILENO) == -1)
+        {
+            _exit(126);
+        }
+
+        close(output_pipe[1]);
+
+        // Replace the child with Bash running the command
+        execl("/bin/bash", "bash", "-c", command, (char *)NULL);
+
+        // Reached only if execl fails
+        perror("execl");
+        _exit(127);
+    }
+
+    // Parent: close the unused write end
+    close(output_pipe[1]);
+
+    int success = 1;
+    char chunk[257];
+
+    // Read the command output in small chunks
+    while (1)
+    {
+        ssize_t bytes_read =
+            read(output_pipe[0], chunk, sizeof(chunk) - 1);
+
+        if (bytes_read > 0)
+        {
+            chunk[bytes_read] = '\0';
+
+            if (!text_buffer_append(buffer, chunk))
+            {
+                success = 0;
+            }
+        }
+        else if (bytes_read == 0)
+        {
+            // End of output
+            break;
+        }
+        else if (errno == EINTR)
+        {
+            // Retry if the read was interrupted
+            continue;
+        }
+        else
+        {
+            perror("read");
+            success = 0;
+            break;
+        }
+    }
+
+    close(output_pipe[0]);
+
+    // Wait for the child process to finish
+    int status;
+    pid_t waited;
+
+    do
+    {
+        waited = waitpid(child, &status, 0);
+    }
+    while (waited == -1 && errno == EINTR);
+
+    if (waited == -1)
+    {
+        perror("waitpid");
+        success = 0;
+    }
+    else if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+    {
+        success = 0;
+    }
+
+    return success;
+}
+
 
 int main(void)
 {
@@ -91,6 +213,16 @@ int main(void)
         XCloseDisplay(display);
         return 1;
     }
+
+    // Temporary test: run a real Bash command
+if (!text_buffer_append(&buffer, "user@terminator> pwd\n") ||
+    !run_command_capture(&buffer, "pwd"))
+{
+    fprintf(stderr, "Could not capture command output\n");
+    free(buffer.data);
+    XCloseDisplay(display);
+    return 1;
+}
 
     // Current command being typed
     char input[256] = "";
