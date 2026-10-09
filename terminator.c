@@ -1,3 +1,4 @@
+
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
@@ -12,6 +13,8 @@ typedef struct
     size_t capacity;
 } TextBuffer;
 
+
+// Initialize an empty text buffer
 static int text_buffer_init(TextBuffer *buffer)
 {
     buffer->capacity = 128;
@@ -29,6 +32,8 @@ static int text_buffer_init(TextBuffer *buffer)
     return 1;
 }
 
+
+// Append text to the buffer, growing it if necessary
 static int text_buffer_append(TextBuffer *buffer, const char *text)
 {
     size_t text_length = strlen(text);
@@ -76,42 +81,20 @@ int main(void)
         fprintf(stderr, "Could not connect to X11\n");
         return 1;
     }
-    // Create a text buffer
-TextBuffer buffer;
 
-if (!text_buffer_init(&buffer))
-{
-    fprintf(stderr, "Could not allocate text buffer\n");
-    XCloseDisplay(display);
-    return 1;
-}
+    // Initialize terminal history
+    TextBuffer buffer;
 
-// Temporary sample text for testing
-const char *sample_text =
-    "user@terminator> pwd\n"
-    "/home/vishwajeet/terminator\n"
-    "user@terminator> ls\n"
-    "terminator.c  x11_input.c\n"
-    "Buffer growth test: line 1\n"
-    "Buffer growth test: line 2\n"
-    "Buffer growth test: line 3\n"
-    "Buffer growth test: line 4\n"
-    "Buffer growth test: line 5\n"
-    "Buffer growth test: line 6\n"
-    "Buffer growth test: line 7\n"
-    "Buffer growth test: line 8\n"
-    "Buffer growth test: line 9\n"
-    "Buffer growth test: line 10\n";
+    if (!text_buffer_init(&buffer))
+    {
+        fprintf(stderr, "Could not allocate text buffer\n");
+        XCloseDisplay(display);
+        return 1;
+    }
 
-if (!text_buffer_append(&buffer, sample_text))
-{
-    fprintf(stderr, "Could not append sample text\n");
-    free(buffer.data);
-    XCloseDisplay(display);
-    return 1;
-}
-
-
+    // Current command being typed
+    char input[256] = "";
+    size_t input_length = 0;
 
     int screen = DefaultScreen(display);
 
@@ -128,89 +111,233 @@ if (!text_buffer_append(&buffer, sample_text))
 
     XStoreName(display, window, "Terminator - Task 1");
 
-    // Select events and display the window
-    XSelectInput(display, window, ExposureMask | KeyPressMask);
+    // Allow the window manager's close button to work
+    Atom wm_delete_window =
+        XInternAtom(display, "WM_DELETE_WINDOW", False);
+
+    XSetWMProtocols(
+        display,
+        window,
+        &wm_delete_window,
+        1
+    );
+
+    // Select events and show the window
+    XSelectInput(
+        display,
+        window,
+        ExposureMask | KeyPressMask
+    );
+
     XMapWindow(display, window);
 
     // Set up drawing
     GC gc = XCreateGC(display, window, 0, NULL);
+
     XFontStruct *font = XLoadQueryFont(display, "fixed");
 
-    if (font != NULL)
+    if (font == NULL)
     {
-        XSetFont(display, gc, font->fid);
+        fprintf(stderr, "Could not load font\n");
+
+        XFreeGC(display, gc);
+        XDestroyWindow(display, window);
+        free(buffer.data);
+        XCloseDisplay(display);
+
+        return 1;
     }
 
+    XSetFont(display, gc, font->fid);
+
     // Main event loop
-    while (1)
+    int running = 1;
+
+    while (running)
     {
         XEvent event;
+
+        // Wait for the next X11 event
         XNextEvent(display, &event);
 
         if (event.type == Expose)
         {
             const char *title = "Terminator - Task 1";
-            
+            const char *prompt = "user@terminator> ";
 
             XClearWindow(display, window);
 
+            // Draw the title
             XDrawString(
-                display, window, gc,
-                30, 40, title, strlen(title)
+                display,
+                window,
+                gc,
+                30, 40,
+                title,
+                (int)strlen(title)
             );
 
-            // Draw text stored in the buffer
-int x = 30;
-int y = 80;
-size_t start = 0;
+            // Draw terminal history, one line at a time
+            int x = 30;
+            int y = 80;
+            size_t start = 0;
 
-for (size_t i = 0; i <= buffer.length; i++)
+            for (size_t i = 0; i < buffer.length; i++)
+            {
+                if (buffer.data[i] == '\n')
+                {
+                    XDrawString(
+                        display,
+                        window,
+                        gc,
+                        x, y,
+                        buffer.data + start,
+                        (int)(i - start)
+                    );
+
+                    y += 22;
+                    start = i + 1;
+                }
+            }
+
+            // Draw any remaining text
+            if (start < buffer.length)
+            {
+                XDrawString(
+                    display,
+                    window,
+                    gc,
+                    x, y,
+                    buffer.data + start,
+                    (int)(buffer.length - start)
+                );
+
+                y += 22;
+            }
+
+            // Draw the prompt
+            XDrawString(
+                display,
+                window,
+                gc,
+                x, y,
+                prompt,
+                (int)strlen(prompt)
+            );
+
+            // Calculate the prompt width
+            int prompt_width = XTextWidth(
+                font,
+                prompt,
+                (int)strlen(prompt)
+            );
+
+            // Draw the current command input
+            XDrawString(
+                display,
+                window,
+                gc,
+                x + prompt_width, y,
+                input,
+                (int)input_length
+            );
+
+            // Send drawing requests to the display
+            XFlush(display);
+        }
+        else if (event.type == KeyPress)
 {
-    if (buffer.data[i] == '\n' || buffer.data[i] == '\0')
-    {
-        XDrawString(
-            display,
-            window,
-            gc,
-            x,
-            y,
-            buffer.data + start,
-            (int)(i - start)
-        );
+    char key_buffer[10];
+    KeySym key;
 
-        y += 22;
-        start = i + 1;
+    int n = XLookupString(
+        &event.xkey,
+        key_buffer,
+        sizeof(key_buffer),
+        &key,
+        NULL
+    );
+
+    int changed = 0;
+
+    // Escape exits the application
+    if (key == XK_Escape)
+    {
+        running = 0;
+    }
+
+    else if (key == XK_Return || key == XK_KP_Enter)
+{
+    char submitted_line[sizeof(input) + 32];
+
+    int written = snprintf(
+        submitted_line,
+        sizeof(submitted_line),
+        "user@terminator> %s\n",
+        input
+    );
+
+    if (written >= 0 &&
+        (size_t)written < sizeof(submitted_line) &&
+        text_buffer_append(&buffer, submitted_line))
+    {
+        input_length = 0;
+        input[0] = '\0';
+        changed = 1;
     }
 }
 
-            
-        }
-        else if (event.type == KeyPress)
+
+    // Backspace deletes the last typed character
+    else if (key == XK_BackSpace)
+    {
+        if (input_length > 0)
         {
-            char buffer[10];
-            KeySym key;
+            input_length--;
+            input[input_length] = '\0';
+            changed = 1;
+        }
+    }
+    // Add ordinary printable characters
+    else
+    {
+        for (int i = 0;
+             i < n && input_length < sizeof(input) - 1;
+             i++)
+        {
+            unsigned char ch = (unsigned char)key_buffer[i];
 
-            XLookupString(
-                &event.xkey,
-                buffer,
-                sizeof(buffer),
-                &key,
-                NULL
-            );
-
-            if (key == XK_Escape)
+            if (ch >= 32 && ch != 127)
             {
-                break;
+                input[input_length] = (char)ch;
+                input_length++;
+                changed = 1;
             }
         }
+
+        input[input_length] = '\0';
     }
 
-    // Release resources
-    if (font != NULL)
+    // Request a redraw when the input changes
+    if (changed)
     {
-        XFreeFont(display, font);
+        XClearArea(display, window, 0, 0, 0, 0, True);
+        XFlush(display);
+    }
+}
+   
+        else if (
+            event.type == ClientMessage &&
+            (Atom)event.xclient.data.l[0] == wm_delete_window
+        )
+        {
+            // Handle the window manager's close button
+            running = 0;
+        }
     }
 
+    // Release resources after the event loop ends
+    XFreeFont(display, font);
     XFreeGC(display, gc);
     XDestroyWindow(display, window);
     free(buffer.data);
@@ -218,4 +345,3 @@ for (size_t i = 0; i <= buffer.length; i++)
 
     return 0;
 }
-
