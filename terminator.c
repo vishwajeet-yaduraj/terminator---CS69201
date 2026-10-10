@@ -9,6 +9,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <signal.h>
 
 typedef struct
 {
@@ -16,6 +17,14 @@ typedef struct
     size_t length;
     size_t capacity;
 } TextBuffer;
+
+typedef struct
+{
+    pid_t pid;
+    int input_fd;
+    int output_fd;
+    unsigned long command_id;
+} ShellProcess;
 
 
 // Initialize an empty text buffer
@@ -74,122 +83,280 @@ static int text_buffer_append(TextBuffer *buffer, const char *text)
     return 1;
 }
 
-// Execute one Bash command and capture its output into the buffer
-static int run_command_capture(TextBuffer *buffer, const char *command)
+static int shell_start(ShellProcess *shell)
 {
-    int output_pipe[2];
+    int to_shell[2];
+    int from_shell[2];
 
-    // Create a pipe for the command's output
-    if (pipe(output_pipe) == -1)
+    if (pipe(to_shell) == -1)
     {
-        perror("pipe");
+        perror("pipe to shell");
         return 0;
     }
 
-    // Create a child process
+    if (pipe(from_shell) == -1)
+    {
+        perror("pipe from shell");
+        close(to_shell[0]);
+        close(to_shell[1]);
+        return 0;
+    }
+
     pid_t child = fork();
 
     if (child == -1)
     {
         perror("fork");
-        close(output_pipe[0]);
-        close(output_pipe[1]);
+        close(to_shell[0]);
+        close(to_shell[1]);
+        close(from_shell[0]);
+        close(from_shell[1]);
         return 0;
     }
 
     if (child == 0)
     {
-        // Child: close the unused read end
-        close(output_pipe[0]);
+        // Child process: connect the pipes to Bash
+        close(to_shell[1]);
+        close(from_shell[0]);
 
-        // Prevent the command from reading input from the console
-        int null_input = open("/dev/null", O_RDONLY);
-
-        if (null_input != -1)
-        {
-            dup2(null_input, STDIN_FILENO);
-            close(null_input);
-        }
-
-        // Redirect both stdout and stderr into the pipe
-        if (dup2(output_pipe[1], STDOUT_FILENO) == -1 ||
-            dup2(output_pipe[1], STDERR_FILENO) == -1)
+        if (dup2(to_shell[0], STDIN_FILENO) == -1 ||
+            dup2(from_shell[1], STDOUT_FILENO) == -1 ||
+            dup2(from_shell[1], STDERR_FILENO) == -1)
         {
             _exit(126);
         }
 
-        close(output_pipe[1]);
+        close(to_shell[0]);
+        close(from_shell[1]);
 
-        // Replace the child with Bash running the command
-        execl("/bin/bash", "bash", "-c", command, (char *)NULL);
+        execl(
+            "/bin/bash",
+            "bash",
+            "--noprofile",
+            "--norc",
+            (char *)NULL
+        );
 
-        // Reached only if execl fails
-        perror("execl");
         _exit(127);
     }
 
-    // Parent: close the unused write end
-    close(output_pipe[1]);
+    // Parent process: retain only the required pipe ends
+    close(to_shell[0]);
+    close(from_shell[1]);
 
-    int success = 1;
-    char chunk[257];
+    shell->pid = child;
+    shell->input_fd = to_shell[1];
+    shell->output_fd = from_shell[0];
+    shell->command_id = 1;
 
-    // Read the command output in small chunks
-    while (1)
+    return 1;
+}
+
+
+static int flush_output_chunk(
+    TextBuffer *buffer,
+    char *chunk,
+    size_t *length
+)
+{
+    if (*length == 0)
     {
-        ssize_t bytes_read =
-            read(output_pipe[0], chunk, sizeof(chunk) - 1);
+        return 1;
+    }
 
-        if (bytes_read > 0)
-        {
-            chunk[bytes_read] = '\0';
+    chunk[*length] = '\0';
 
-            if (!text_buffer_append(buffer, chunk))
-            {
-                success = 0;
-            }
-        }
-        else if (bytes_read == 0)
+    int success = text_buffer_append(buffer, chunk);
+
+    *length = 0;
+
+    return success;
+}
+
+
+static int shell_run_command(
+    ShellProcess *shell,
+    TextBuffer *buffer,
+    const char *command
+)
+{
+    char marker[96];
+    char request[512];
+
+    int marker_size = snprintf(
+        marker,
+        sizeof(marker),
+        "__TERMINATOR_DONE_%ld_%lu__",
+        (long)shell->pid,
+        shell->command_id++
+    );
+
+    if (marker_size < 0 ||
+        (size_t)marker_size >= sizeof(marker))
+    {
+        return 0;
+    }
+
+    // Send the command, followed by a unique completion marker
+    int request_size = snprintf(
+        request,
+        sizeof(request),
+        "%s\nprintf '%%s' '%s'\n",
+        command,
+        marker
+    );
+
+    if (request_size < 0 ||
+        (size_t)request_size >= sizeof(request))
+    {
+        return 0;
+    }
+
+    size_t request_length = (size_t)request_size;
+    size_t sent = 0;
+
+    while (sent < request_length)
+    {
+        ssize_t n = write(
+            shell->input_fd,
+            request + sent,
+            request_length - sent
+        );
+
+        if (n > 0)
         {
-            // End of output
-            break;
+            sent += (size_t)n;
         }
-        else if (errno == EINTR)
+        else if (n == -1 && errno == EINTR)
         {
-            // Retry if the read was interrupted
             continue;
         }
         else
         {
-            perror("read");
-            success = 0;
-            break;
+            perror("write to Bash");
+            return 0;
         }
     }
 
-    close(output_pipe[0]);
+    // Read output until we encounter this command's marker
+    size_t marker_length = strlen(marker);
+    char pending[96];
+    size_t pending_length = 0;
 
-    // Wait for the child process to finish
+    char output_chunk[1025];
+    size_t output_length = 0;
+
+    int found_marker = 0;
+    int success = 1;
+
+    while (!found_marker)
+    {
+        char ch;
+
+        ssize_t n = read(
+            shell->output_fd,
+            &ch,
+            1
+        );
+
+        if (n == 0)
+        {
+            break;
+        }
+
+        if (n == -1)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+
+            perror("read from Bash");
+            success = 0;
+            break;
+        }
+
+        pending[pending_length++] = ch;
+
+        if (pending_length == marker_length)
+        {
+            if (memcmp(pending, marker, marker_length) == 0)
+            {
+                found_marker = 1;
+                break;
+            }
+
+            // The first pending byte cannot be part of
+            // a marker beginning at this position.
+            output_chunk[output_length++] = pending[0];
+
+            memmove(
+                pending,
+                pending + 1,
+                --pending_length
+            );
+
+            if (output_length == sizeof(output_chunk) - 1)
+            {
+                if (!flush_output_chunk(
+                        buffer,
+                        output_chunk,
+                        &output_length))
+                {
+                    success = 0;
+                }
+            }
+        }
+    }
+
+    // Preserve any unread output if Bash stopped unexpectedly
+    if (!found_marker)
+    {
+        for (size_t i = 0; i < pending_length; i++)
+        {
+            output_chunk[output_length++] = pending[i];
+
+            if (output_length == sizeof(output_chunk) - 1)
+            {
+                if (!flush_output_chunk(
+                        buffer,
+                        output_chunk,
+                        &output_length))
+                {
+                    success = 0;
+                }
+            }
+        }
+    }
+
+    if (!flush_output_chunk(
+            buffer,
+            output_chunk,
+            &output_length))
+    {
+        success = 0;
+    }
+
+    return found_marker && success;
+}
+
+
+static void shell_close(ShellProcess *shell)
+{
+    // Closing the input pipe tells Bash that no more
+    // commands will be sent.
+    close(shell->input_fd);
+    close(shell->output_fd);
+
     int status;
-    pid_t waited;
+    pid_t result;
 
     do
     {
-        waited = waitpid(child, &status, 0);
+        result = waitpid(shell->pid, &status, 0);
     }
-    while (waited == -1 && errno == EINTR);
-
-    if (waited == -1)
-    {
-        perror("waitpid");
-        success = 0;
-    }
-    else if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
-    {
-        success = 0;
-    }
-
-    return success;
+    while (result == -1 && errno == EINTR);
 }
 
 
@@ -203,6 +370,7 @@ int main(void)
         fprintf(stderr, "Could not connect to X11\n");
         return 1;
     }
+    signal(SIGPIPE, SIG_IGN);
 
     // Initialize terminal history
     TextBuffer buffer;
@@ -213,6 +381,17 @@ int main(void)
         XCloseDisplay(display);
         return 1;
     }
+
+    // Start the persistent Bash session
+ShellProcess shell;
+
+if (!shell_start(&shell))
+{
+    fprintf(stderr, "Could not start Bash\n");
+    free(buffer.data);
+    XCloseDisplay(display);
+    return 1;
+}
 
 
 
@@ -260,18 +439,20 @@ int main(void)
 
     XFontStruct *font = XLoadQueryFont(display, "fixed");
 
-    if (font == NULL)
-    {
-        fprintf(stderr, "Could not load font\n");
+if (font == NULL)
+{
+    fprintf(stderr, "Could not load font\n");
 
-        XFreeGC(display, gc);
-        XDestroyWindow(display, window);
-        free(buffer.data);
-        XCloseDisplay(display);
+    XFreeGC(display, gc);
+    XDestroyWindow(display, window);
 
-        return 1;
-    }
+    shell_close(&shell);  // ADD THIS LINE
 
+    free(buffer.data);
+    XCloseDisplay(display);
+
+    return 1;
+}
     XSetFont(display, gc, font->fid);
 
     // Main event loop
@@ -408,7 +589,13 @@ int main(void)
         // Execute the submitted command if it isn't empty
         if (input_length > 0)
         {
-            (void)run_command_capture(&buffer, input);
+           if (!shell_run_command(&shell, &buffer, input))
+{
+    text_buffer_append(
+        &buffer,
+        "[Terminator: Bash communication failed]\n"
+    );
+}
         }
 
         // Clear the command input
@@ -473,6 +660,9 @@ int main(void)
     XFreeFont(display, font);
     XFreeGC(display, gc);
     XDestroyWindow(display, window);
+
+    shell_close(&shell);  // ADD THIS LINE
+
     free(buffer.data);
     XCloseDisplay(display);
 
