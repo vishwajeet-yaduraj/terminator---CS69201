@@ -447,7 +447,8 @@ static void draw_terminal(
     const TextBuffer *buffer,
     const char *input,
     size_t input_length,
-    const ShellProcess *shell
+    const ShellProcess *shell,
+    size_t *scroll_offset
 )
 {
     const char *title = "Terminator - Task 1";
@@ -464,33 +465,153 @@ static void draw_terminal(
         title, (int)strlen(title)
     );
 
-    // Draw each complete history line.
-    for (size_t i = 0; i < buffer->length; i++)
+    // Count the lines stored in terminal history.
+size_t history_lines = 0;
+
+for (size_t i = 0; i < buffer->length; i++)
+{
+    if (buffer->data[i] == '\n')
     {
-        if (buffer->data[i] == '\n')
+        history_lines++;
+    }
+}
+
+// Count the final line if it doesn't end with a newline.
+if (buffer->length > 0 &&
+    buffer->data[buffer->length - 1] != '\n')
+{
+    history_lines++;
+}
+
+// Determine how many rows fit in the window.
+XWindowAttributes attributes;
+int visible_rows = 18;
+
+if (XGetWindowAttributes(display, window, &attributes))
+{
+    int available_height = attributes.height - 80 - 10;
+    visible_rows = available_height / 22;
+
+    if (visible_rows < 1)
+    {
+        visible_rows = 1;
+    }
+}
+
+// Include one row for the current prompt or status.
+size_t total_rows = history_lines + 1;
+size_t rows = (size_t)visible_rows;
+
+size_t max_scroll = total_rows > rows
+    ? total_rows - rows
+    : 0;
+
+// Clamp the offset to the available history.
+if (*scroll_offset > max_scroll)
+{
+    *scroll_offset = max_scroll;
+}
+
+// Select the visible range of lines.
+    size_t first_line = max_scroll - *scroll_offset;
+    size_t end_line = first_line + rows;
+
+// int y = 80;
+// size_t start = 0;
+    size_t line_number = 0;
+
+// Draw complete history lines in the selected range.
+for (size_t i = 0; i < buffer->length; i++)
+{
+    if (buffer->data[i] == '\n')
+    {
+        if (line_number >= first_line &&
+            line_number < end_line)
         {
             XDrawString(
-                display, window, gc,
-                x, y,
+                display,
+                window,
+                gc,
+                x,
+                y,
                 buffer->data + start,
                 (int)(i - start)
             );
-            y += 22;
-            start = i + 1;
-        }
-    }
 
-    // Draw any final line that does not end in a newline.
-    if (start < buffer->length)
+            y += 22;
+        }
+
+        line_number++;
+        start = i + 1;
+    }
+}
+
+// Draw the final line if it has no terminating newline.
+if (start < buffer->length)
+{
+    if (line_number >= first_line &&
+        line_number < end_line)
     {
         XDrawString(
-            display, window, gc,
-            x, y,
+            display,
+            window,
+            gc,
+            x,
+            y,
             buffer->data + start,
             (int)(buffer->length - start)
         );
+
         y += 22;
     }
+
+    line_number++;
+}
+
+// Draw the prompt or status only if its row is visible.
+if (history_lines >= first_line &&
+    history_lines < end_line)
+{
+    if (shell->command_running)
+    {
+        const char *status = "[Command running...]";
+
+        XDrawString(
+            display, window, gc,
+            x, y, status, (int)strlen(status)
+        );
+    }
+    else if (!shell->alive)
+    {
+        const char *status = "[Bash session ended]";
+
+        XDrawString(
+            display, window, gc,
+            x, y, status, (int)strlen(status)
+        );
+    }
+    else
+    {
+        XDrawString(
+            display, window, gc,
+            x, y, prompt, (int)strlen(prompt)
+        );
+
+        int prompt_width = XTextWidth(
+            font, prompt, (int)strlen(prompt)
+        );
+
+        XDrawString(
+            display, window, gc,
+            x + prompt_width, y,
+            input, (int)input_length
+        );
+    }
+}
+
+   
+
+
 
     if (shell->command_running)
     {
@@ -548,6 +669,7 @@ int main(void)
 
     char input[256] = "";
     size_t input_length = 0;
+    size_t scroll_offset = 0;
     int running = 1;
 
     int screen = DefaultScreen(display);
@@ -566,7 +688,7 @@ int main(void)
     Atom wm_delete_window = XInternAtom(display, "WM_DELETE_WINDOW", False);
     (void)XSetWMProtocols(display, window, &wm_delete_window, 1);
 
-    XSelectInput(display, window, ExposureMask | KeyPressMask);
+    XSelectInput(display, window,ExposureMask | KeyPressMask | ButtonPressMask);
     XMapWindow(display, window);
 
     GC gc = XCreateGC(display, window, 0, NULL);
@@ -597,7 +719,8 @@ int main(void)
             {
                 draw_terminal(
                     display, window, gc, font,
-                    &buffer, input, input_length, &shell
+                    &buffer, input, input_length, &shell,
+                    &scroll_offset
                 );
             }
             else if (event.type == KeyPress)
@@ -618,6 +741,33 @@ int main(void)
                 {
                     running = 0;
                 }
+
+                else if (key == XK_Page_Up)
+{
+    // Move toward older history.
+    scroll_offset += 10;
+    changed = 1;
+}
+else if (key == XK_Page_Down)
+{
+    // Move toward the latest output.
+    if (scroll_offset > 10)
+    {
+        scroll_offset -= 10;
+    }
+    else
+    {
+        scroll_offset = 0;
+    }
+
+    changed = 1;
+}
+else if (key == XK_End)
+{
+    // Return to the latest output.
+    scroll_offset = 0;
+    changed = 1;
+}
                 else if (shell.command_running || !shell.alive)
                 {
                     // While a command runs, or after Bash exits,
@@ -689,6 +839,32 @@ int main(void)
                     request_redraw(display, window);
                 }
             }
+
+            else if (event.type == ButtonPress)
+{
+    if (event.xbutton.button == Button4)
+    {
+        // Mouse wheel up: show older history.
+        scroll_offset += 3;
+
+        request_redraw(display, window);
+    }
+    else if (event.xbutton.button == Button5)
+    {
+        // Mouse wheel down: show newer history.
+        if (scroll_offset > 3)
+        {
+            scroll_offset -= 3;
+        }
+        else
+        {
+            scroll_offset = 0;
+        }
+
+        request_redraw(display, window);
+    }
+}
+
             else if (event.type == ClientMessage &&
                      (Atom)event.xclient.data.l[0] == wm_delete_window)
             {
